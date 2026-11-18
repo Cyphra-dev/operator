@@ -1,0 +1,10 @@
+apiVersion: v2
+name: cyphra-operator
+description: Run Neo4j Community instances on Kubernetes with TLS, generated credentials and scheduled S3 backups.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/Cyphra-dev/operator
+sources:
+  - https://github.com/Cyphra-dev/operator
+keywords: [neo4j, graph, database, operator, cyphra]

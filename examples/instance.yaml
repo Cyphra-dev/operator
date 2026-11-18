@@ -1,0 +1,39 @@
+# A Neo4j Community instance with TLS (cert-manager) and nightly backups to S3.
+#
+#   kubectl create secret generic s3-backups \
+#     --from-literal=accessKeyId=... --from-literal=secretAccessKey=...
+#   kubectl apply -f examples/instance.yaml
+#   kubectl get neo4jinstances
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: blog
+spec:
+  secretName: blog-tls
+  dnsNames: [blog.default.svc, blog.example.com]
+  issuerRef: { name: letsencrypt, kind: ClusterIssuer }
+---
+apiVersion: cyphra.dev/v1alpha1
+kind: Neo4jInstance
+metadata:
+  name: blog
+spec:
+  version: "5.26"
+  resources:
+    requests: { cpu: 500m, memory: 2Gi }
+    limits: { memory: 2Gi } # heap and page cache are sized from this
+  storage:
+    size: 20Gi
+  service:
+    type: LoadBalancer
+  tls:
+    secretName: blog-tls
+  backup:
+    schedule: "0 3 * * *" # UTC
+    retentionDays: 14
+    s3:
+      bucket: my-neo4j-backups
+      region: eu-west-1
+      credentialsSecretName: s3-backups
+  config:
+    db.transaction.timeout: 60s

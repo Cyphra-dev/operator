@@ -1,0 +1,37 @@
+# Minimal S3-compatible server for the e2e test (bucket "dumps" is a directory).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3
+spec:
+  selector:
+    matchLabels: { app: s3 }
+  template:
+    metadata:
+      labels: { app: s3 }
+    spec:
+      containers:
+        - name: s3
+          image: RCLONE_IMG
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - mkdir -p /data/dumps && exec rclone serve s3 --addr :9000 --auth-key e2e-access,e2e-secret-key /data
+          ports:
+            - containerPort: 9000
+          readinessProbe:
+            tcpSocket: { port: 9000 }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3
+spec:
+  selector: { app: s3 }
+  ports:
+    - port: 9000

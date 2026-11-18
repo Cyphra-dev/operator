@@ -1,0 +1,29 @@
+apiVersion: cyphra.dev/v1alpha1
+kind: Neo4jInstance
+metadata:
+  name: blog
+spec:
+  version: "NEO4J_VERSION"
+  storage: { size: 1Gi }
+  resources:
+    limits: { memory: 1Gi }
+  backup:
+    schedule: "0 0 1 1 *"
+    retentionDays: 7
+    s3:
+      bucket: dumps
+      endpoint: http://s3:9000
+      region: us-east-1
+      credentialsSecretName: s3
+---
+apiVersion: cyphra.dev/v1alpha1
+kind: Neo4jInstance
+metadata:
+  name: secure
+spec:
+  version: "NEO4J_VERSION"
+  storage: { size: 1Gi }
+  resources:
+    limits: { memory: 1Gi }
+  tls:
+    secretName: secure-tls
