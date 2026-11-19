@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -464,4 +466,30 @@ echo "uploaded s3://${BUCKET}/${KEY}"`
 			},
 		},
 	}
+}
+
+// TLSHashAnnotation on the pod template changes when the TLS certificate does, rolling the pod.
+const TLSHashAnnotation = "cyphra.dev/tls-hash"
+
+// TLSHash is a short fingerprint of a TLS Secret's certificate, key and CA.
+func TLSHash(secret *corev1.Secret) string {
+	h := sha256.New()
+	for _, k := range []string{corev1.TLSCertKey, corev1.TLSPrivateKeyKey, "ca.crt"} {
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		h.Write(secret.Data[k])
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// SetTLSHash records the TLS fingerprint on a pod template (no-op for "").
+func SetTLSHash(t *corev1.PodTemplateSpec, hash string) {
+	if hash == "" {
+		return
+	}
+	if t.Annotations == nil {
+		t.Annotations = map[string]string{}
+	}
+	t.Annotations[TLSHashAnnotation] = hash
 }

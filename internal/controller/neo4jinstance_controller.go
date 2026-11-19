@@ -22,7 +22,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	cyphrav1 "github.com/Cyphra-dev/operator/api/v1alpha1"
 )
@@ -118,9 +120,14 @@ func (r *Neo4jInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if inst.Status.Backup.ActiveJob != "" || inst.Spec.Stopped {
 		replicas = 0
 	}
+	tlsHash, err := r.tlsHash(ctx, &inst)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("tls secret: %w", err)
+	}
 	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: inst.Name, Namespace: inst.Namespace}}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
 		desired := StatefulSetSpec(&inst, replicas)
+		SetTLSHash(&desired.Template, tlsHash)
 		if sts.CreationTimestamp.IsZero() {
 			sts.Spec = desired
 		} else {
@@ -517,6 +524,41 @@ func (r *Neo4jInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&corev1.Secret{}).
 		Owns(&batchv1.Job{}).
+		// TLS Secrets are usually not ours (cert-manager or the user creates them); a renewal must
+		// roll the pod because Neo4j only loads certificates at startup.
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.instancesForTLSSecret)).
 		Named("neo4jinstance").
 		Complete(r)
+}
+
+// tlsHash fingerprints the instance's TLS Secret ("" without TLS or before the Secret exists).
+func (r *Neo4jInstanceReconciler) tlsHash(ctx context.Context, inst *cyphrav1.Neo4jInstance) (string, error) {
+	if inst.Spec.TLS == nil {
+		return "", nil
+	}
+	var secret corev1.Secret
+	err := r.Get(ctx, types.NamespacedName{Namespace: inst.Namespace, Name: TLSSecretName(inst)}, &secret)
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return TLSHash(&secret), nil
+}
+
+// instancesForTLSSecret maps a Secret to the instances in its namespace that use it for TLS.
+func (r *Neo4jInstanceReconciler) instancesForTLSSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	var list cyphrav1.Neo4jInstanceList
+	if err := r.List(ctx, &list, client.InNamespace(obj.GetNamespace())); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range list.Items {
+		inst := &list.Items[i]
+		if inst.Spec.TLS != nil && TLSSecretName(inst) == obj.GetName() {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: inst.Namespace, Name: inst.Name}})
+		}
+	}
+	return reqs
 }

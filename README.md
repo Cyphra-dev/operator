@@ -96,6 +96,10 @@ writing into `tls.secretName` (default `<name>-tls`). The instance becomes `Read
 `CertManagerNotInstalled` and a `tls.secretName` you manage yourself still works. For Let's Encrypt,
 use a DNS-01 solver: the Service only serves Bolt and HTTPS, so HTTP-01 challenges cannot reach it.
 
+Neo4j loads certificates only at startup. When the TLS Secret changes, whether cert-manager renews it or you
+replace it, the operator restarts the instance so it serves the new certificate. Expect a short
+interruption about once per renewal, which is every 60 days with Let's Encrypt.
+
 **One LoadBalancer per instance** is the default. It is simple, but every instance costs a cloud
 load balancer. The design also works behind a single shared L4 proxy that routes on TLS SNI
 (Traefik `HostSNI`, HAProxy, Envoy, Contour `TLSRoute` passthrough, and so on): Neo4j terminates TLS
