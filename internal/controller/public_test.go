@@ -461,3 +461,24 @@ func TestVolumeExpansionNotSupported(t *testing.T) {
 		t.Errorf("PVC changed to %s", req.String())
 	}
 }
+
+func TestTLSHashRollsPodOnRenewal(t *testing.T) {
+	s := &corev1.Secret{Data: map[string][]byte{corev1.TLSCertKey: []byte("cert-1"), corev1.TLSPrivateKeyKey: []byte("key")}}
+	h1 := TLSHash(s)
+	if len(h1) != 16 || h1 != TLSHash(s) {
+		t.Fatalf("hash must be stable and 16 chars, got %q", h1)
+	}
+	s.Data[corev1.TLSCertKey] = []byte("cert-2")
+	if TLSHash(s) == h1 {
+		t.Fatal("a renewed certificate must change the hash")
+	}
+	var tpl corev1.PodTemplateSpec
+	SetTLSHash(&tpl, "")
+	if tpl.Annotations != nil {
+		t.Fatal("no TLS: no annotation")
+	}
+	SetTLSHash(&tpl, h1)
+	if tpl.Annotations[TLSHashAnnotation] != h1 {
+		t.Fatal("hash not set on pod template")
+	}
+}
