@@ -7,6 +7,7 @@ import (
 )
 
 // Neo4jInstanceSpec is the desired state of a single-server Neo4j Community instance.
+// +kubebuilder:validation:XValidation:rule="!has(self.hostname) || has(self.tls)",message="hostname requires tls (secretName or issuerRef)"
 type Neo4jInstanceSpec struct {
 	// Neo4j version, used as the image tag `neo4j:<version>-community`.
 	// +kubebuilder:default="5.26"
@@ -33,6 +34,15 @@ type Neo4jInstanceSpec struct {
 	// Service exposes Bolt (7687) and HTTP (7474).
 	// +optional
 	Service ServiceSpec `json:"service,omitempty"`
+
+	// Hostname is the public DNS name clients use, e.g. `abc123.eu.db.example.com`. When set,
+	// `status.endpoint` becomes `neo4j+s://<hostname>:7687`, Neo4j advertises this name to routing
+	// drivers, the client Service gets an `external-dns.alpha.kubernetes.io/hostname` annotation and
+	// its type defaults to LoadBalancer. Requires `tls`.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	Hostname string `json:"hostname,omitempty"`
 
 	// TLS enables encrypted Bolt and HTTPS using a `kubernetes.io/tls` Secret (e.g. from cert-manager).
 	// +optional
@@ -62,8 +72,9 @@ type StorageSpec struct {
 
 // ServiceSpec configures the client-facing Service.
 type ServiceSpec struct {
+	// Type of the Service. Defaults to LoadBalancer when `hostname` is set, ClusterIP otherwise.
 	// +kubebuilder:validation:Enum=ClusterIP;LoadBalancer;NodePort
-	// +kubebuilder:default=ClusterIP
+	// +optional
 	Type corev1.ServiceType `json:"type,omitempty"`
 	// Annotations for the Service (e.g. cloud load-balancer settings).
 	// +optional
@@ -71,9 +82,30 @@ type ServiceSpec struct {
 }
 
 // TLSSpec references the certificate used for Bolt and HTTPS.
+// +kubebuilder:validation:XValidation:rule="(has(self.secretName) && self.secretName != ”) || has(self.issuerRef)",message="tls needs secretName, issuerRef or both"
 type TLSSpec struct {
 	// SecretName of a `kubernetes.io/tls` Secret with `tls.crt` and `tls.key`.
-	SecretName string `json:"secretName"`
+	// With `issuerRef`, the issued certificate is written here; it then defaults to `<name>-tls`.
+	// +optional
+	SecretName string `json:"secretName,omitempty"`
+	// IssuerRef makes the operator request the certificate from cert-manager: a
+	// `cert-manager.io/v1` Certificate for `hostname` (or the in-cluster Service names when no
+	// hostname is set). The instance becomes Ready once the certificate is issued.
+	// +optional
+	IssuerRef *IssuerRef `json:"issuerRef,omitempty"`
+}
+
+// IssuerRef references a cert-manager Issuer or ClusterIssuer.
+type IssuerRef struct {
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// Kind is `Issuer` (same namespace) or `ClusterIssuer`, or an external issuer's kind.
+	// +kubebuilder:default=Issuer
+	// +optional
+	Kind string `json:"kind,omitempty"`
+	// Group of an external issuer; defaults to `cert-manager.io`.
+	// +optional
+	Group string `json:"group,omitempty"`
 }
 
 // BackupSpec configures scheduled backups.
@@ -86,7 +118,7 @@ type BackupSpec struct {
 	// Keep backups for this many days (older dumps under the prefix are deleted). 0 keeps everything.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:default=7
-	RetentionDays int32 `json:"retentionDays,omitempty"`
+	RetentionDays int32  `json:"retentionDays,omitempty"`
 	S3            S3Spec `json:"s3"`
 	// Suspend stops scheduling new backups.
 	// +optional
@@ -125,7 +157,25 @@ const (
 const (
 	ConditionReady        = "Ready"
 	ConditionBackupFailed = "BackupFailed"
+	// ConditionCertificateReady mirrors the cert-manager Certificate when `tls.issuerRef` is set.
+	ConditionCertificateReady = "CertificateReady"
+	// ConditionStorageResizeFailed is True when `storage.size` cannot be applied to the data volume
+	// (shrinking, or a StorageClass without volume expansion).
+	ConditionStorageResizeFailed = "StorageResizeFailed"
 )
+
+// StorageStatus reports the data volume's size and usage.
+type StorageStatus struct {
+	// Bytes used on the data volume, as reported by the kubelet. Kept while the instance is stopped.
+	// +optional
+	UsedBytes int64 `json:"usedBytes,omitempty"`
+	// Provisioned size of the data volume (the PersistentVolumeClaim's capacity).
+	// +optional
+	CapacityBytes int64 `json:"capacityBytes,omitempty"`
+	// When usedBytes was last measured.
+	// +optional
+	LastUpdateTime *metav1.Time `json:"lastUpdateTime,omitempty"`
+}
 
 // BackupStatus records backup progress.
 type BackupStatus struct {
@@ -145,7 +195,8 @@ type BackupStatus struct {
 type Neo4jInstanceStatus struct {
 	// +optional
 	Phase Phase `json:"phase,omitempty"`
-	// Bolt URI clients use inside the cluster, e.g. neo4j://blog.default.svc:7687.
+	// Bolt URI clients use: in-cluster (neo4j://blog.default.svc:7687), or the public
+	// neo4j+s://<hostname>:7687 when `spec.hostname` is set.
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
 	// Secret (and key) holding the password.
@@ -155,6 +206,8 @@ type Neo4jInstanceStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 	// +optional
 	Backup BackupStatus `json:"backup,omitempty"`
+	// +optional
+	Storage StorageStatus `json:"storage,omitempty"`
 	// +optional
 	// +listType=map
 	// +listMapKey=type
@@ -168,6 +221,9 @@ type Neo4jInstanceStatus struct {
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Version",type=string,JSONPath=`.spec.version`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
+// +kubebuilder:printcolumn:name="Size",type=string,JSONPath=`.spec.storage.size`
+// +kubebuilder:printcolumn:name="Used bytes",type=integer,JSONPath=`.status.storage.usedBytes`,priority=1
+// +kubebuilder:printcolumn:name="Hostname",type=string,JSONPath=`.spec.hostname`,priority=1
 // +kubebuilder:printcolumn:name="Last backup",type=date,JSONPath=`.status.backup.lastSuccessfulTime`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 type Neo4jInstance struct {

@@ -10,6 +10,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 
@@ -30,7 +32,13 @@ const (
 
 	// RcloneImage uploads dumps to S3-compatible storage.
 	RcloneImage = "rclone/rclone:1.71"
+
+	// ExternalDNSHostnameAnnotation asks external-dns to publish the Service under spec.hostname.
+	ExternalDNSHostnameAnnotation = "external-dns.alpha.kubernetes.io/hostname"
 )
+
+// DefaultStorageSize is used when spec.storage.size is empty.
+var DefaultStorageSize = resource.MustParse("10Gi")
 
 // Names of the objects owned by an instance.
 func authSecretName(inst *cyphrav1.Neo4jInstance) string { return inst.Name + "-auth" }
@@ -38,8 +46,30 @@ func headlessServiceName(inst *cyphrav1.Neo4jInstance) string {
 	return inst.Name + "-headless"
 }
 
+// TLSSecretName is the Secret mounted for TLS: spec.tls.secretName, or `<name>-tls` when the
+// certificate is issued by cert-manager.
+func TLSSecretName(inst *cyphrav1.Neo4jInstance) string {
+	if inst.Spec.TLS != nil && inst.Spec.TLS.SecretName != "" {
+		return inst.Spec.TLS.SecretName
+	}
+	return inst.Name + "-tls"
+}
+
+// PodName is the single Neo4j pod of the StatefulSet.
+func PodName(inst *cyphrav1.Neo4jInstance) string { return inst.Name + "-0" }
+
+// DesiredStorage is the requested size of the data volume.
+func DesiredStorage(inst *cyphrav1.Neo4jInstance) resource.Quantity {
+	if inst.Spec.Storage.Size.IsZero() {
+		return DefaultStorageSize.DeepCopy()
+	}
+	return inst.Spec.Storage.Size.DeepCopy()
+}
+
 // PVCName is the claim created by the StatefulSet's volumeClaimTemplate for pod 0.
-func PVCName(inst *cyphrav1.Neo4jInstance) string { return fmt.Sprintf("%s-%s-0", dataVolume, inst.Name) }
+func PVCName(inst *cyphrav1.Neo4jInstance) string {
+	return fmt.Sprintf("%s-%s-0", dataVolume, inst.Name)
+}
 
 // Labels applied to every owned object; SelectorLabels is the immutable subset used by selectors.
 func SelectorLabels(inst *cyphrav1.Neo4jInstance) map[string]string {
@@ -79,8 +109,11 @@ func PasswordRef(inst *cyphrav1.Neo4jInstance) corev1.SecretKeySelector {
 	}
 }
 
-// Endpoint is the in-cluster Bolt URI.
+// Endpoint is the Bolt URI clients use: the public hostname when set, the in-cluster Service otherwise.
 func Endpoint(inst *cyphrav1.Neo4jInstance) string {
+	if inst.Spec.Hostname != "" {
+		return fmt.Sprintf("neo4j+s://%s:%d", inst.Spec.Hostname, boltPort)
+	}
 	scheme := "neo4j"
 	if inst.Spec.TLS != nil {
 		scheme = "neo4j+s"
@@ -119,6 +152,11 @@ func Settings(inst *cyphrav1.Neo4jInstance) map[string]string {
 		s["server.bolt.tls_level"] = "REQUIRED"
 		s["server.https.enabled"] = "true"
 		s["server.http.enabled"] = "false"
+	}
+	if inst.Spec.Hostname != "" {
+		// Routing drivers (neo4j+s://) connect to the address the server advertises, so it must be
+		// the public name rather than the pod's.
+		s["server.default_advertised_address"] = inst.Spec.Hostname
 	}
 	for k, v := range inst.Spec.Config {
 		s[k] = v
@@ -178,17 +216,14 @@ func StatefulSetSpec(inst *cyphrav1.Neo4jInstance, replicas int32) appsv1.Statef
 		volumes = append(volumes, corev1.Volume{
 			Name: tlsVolume,
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-				SecretName:  inst.Spec.TLS.SecretName,
+				SecretName:  TLSSecretName(inst),
 				DefaultMode: ptr.To[int32](0o440),
 			}},
 		})
 	}
 	bolt := corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(boltPort)}}
 
-	storage := inst.Spec.Storage.Size
-	if storage.IsZero() {
-		storage = resource.MustParse("10Gi")
-	}
+	storage := DesiredStorage(inst)
 
 	return appsv1.StatefulSetSpec{
 		Replicas:            ptr.To(replicas),
@@ -235,6 +270,90 @@ func StatefulSetSpec(inst *cyphrav1.Neo4jInstance, replicas int32) appsv1.Statef
 			WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
 		},
 	}
+}
+
+// ServiceType is the client Service type: spec.service.type, else LoadBalancer for a public
+// hostname and ClusterIP otherwise.
+func ServiceType(inst *cyphrav1.Neo4jInstance) corev1.ServiceType {
+	switch {
+	case inst.Spec.Service.Type != "":
+		return inst.Spec.Service.Type
+	case inst.Spec.Hostname != "":
+		return corev1.ServiceTypeLoadBalancer
+	default:
+		return corev1.ServiceTypeClusterIP
+	}
+}
+
+// ServiceAnnotations are the user's annotations plus the external-dns hostname (user values win).
+func ServiceAnnotations(inst *cyphrav1.Neo4jInstance) map[string]string {
+	if inst.Spec.Hostname == "" && len(inst.Spec.Service.Annotations) == 0 {
+		return nil
+	}
+	a := map[string]string{}
+	if inst.Spec.Hostname != "" {
+		a[ExternalDNSHostnameAnnotation] = inst.Spec.Hostname
+	}
+	for k, v := range inst.Spec.Service.Annotations {
+		a[k] = v
+	}
+	return a
+}
+
+// Certificate builds the cert-manager Certificate for spec.tls.issuerRef. It is unstructured so
+// that cert-manager stays an optional dependency.
+func Certificate(inst *cyphrav1.Neo4jInstance) *unstructured.Unstructured {
+	ref := inst.Spec.TLS.IssuerRef
+	kind, group := ref.Kind, ref.Group
+	if kind == "" {
+		kind = "Issuer"
+	}
+	if group == "" {
+		group = "cert-manager.io"
+	}
+	dnsNames := []any{inst.Spec.Hostname}
+	if inst.Spec.Hostname == "" {
+		dnsNames = []any{
+			fmt.Sprintf("%s.%s.svc", inst.Name, inst.Namespace),
+			fmt.Sprintf("%s.%s.svc.cluster.local", inst.Name, inst.Namespace),
+		}
+	}
+	labels := map[string]any{}
+	for k, v := range Labels(inst) {
+		labels[k] = v
+	}
+	cert := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{
+			"secretName": TLSSecretName(inst),
+			"dnsNames":   dnsNames,
+			"issuerRef":  map[string]any{"name": ref.Name, "kind": kind, "group": group},
+			// Neo4j (Java) reads PKCS#8 keys.
+			"privateKey":     map[string]any{"algorithm": "RSA", "size": int64(2048), "encoding": "PKCS8", "rotationPolicy": "Always"},
+			"secretTemplate": map[string]any{"labels": labels},
+		},
+	}}
+	cert.SetGroupVersionKind(CertificateGVK)
+	cert.SetName(inst.Name)
+	cert.SetNamespace(inst.Namespace)
+	cert.SetLabels(Labels(inst))
+	return cert
+}
+
+// CertificateGVK is cert-manager's Certificate kind.
+var CertificateGVK = schema.GroupVersionKind{Group: "cert-manager.io", Version: "v1", Kind: "Certificate"}
+
+// CertificateReady reports the Certificate's Ready condition and its message.
+func CertificateReady(cert *unstructured.Unstructured) (bool, string) {
+	conds, _, _ := unstructured.NestedSlice(cert.Object, "status", "conditions")
+	for _, c := range conds {
+		m, ok := c.(map[string]any)
+		if !ok || m["type"] != "Ready" {
+			continue
+		}
+		msg, _ := m["message"].(string)
+		return m["status"] == "True", msg
+	}
+	return false, "waiting for cert-manager to issue the certificate"
 }
 
 // ServicePorts are the client-facing ports.

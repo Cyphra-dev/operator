@@ -4,6 +4,7 @@ package main
 import (
 	"flag"
 	"os"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -27,6 +28,9 @@ func init() {
 func main() {
 	var metricsAddr, probeAddr string
 	var leaderElect bool
+	var usageInterval time.Duration
+	flag.DurationVar(&usageInterval, "usage-refresh-interval", controller.DefaultUsageInterval,
+		"How often to measure data volume usage through the kubelet stats summary (0 disables it).")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address the metrics endpoint binds to (0 disables it).")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address the health probe endpoint binds to.")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election (needed when running more than one replica).")
@@ -48,11 +52,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.Neo4jInstanceReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("cyphra-operator"),
-	}).SetupWithManager(mgr); err != nil {
+	reconciler := &controller.Neo4jInstanceReconciler{
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		Recorder:      mgr.GetEventRecorder("cyphra-operator"),
+		UsageInterval: usageInterval,
+	}
+	if usageInterval > 0 {
+		if reconciler.StatsSummary, err = controller.KubeletStatsSummary(mgr.GetConfig()); err != nil {
+			log.Error(err, "unable to create the kubelet stats client")
+			os.Exit(1)
+		}
+	}
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to create controller")
 		os.Exit(1)
 	}

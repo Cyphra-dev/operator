@@ -152,9 +152,17 @@ type harness struct {
 }
 
 func newHarness(t *testing.T, inst *cyphrav1.Neo4jInstance, objs ...client.Object) *harness {
+	return newHarnessWithScheme(t, newScheme(), inst, objs...)
+}
+
+func newScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(s)
 	_ = cyphrav1.AddToScheme(s)
+	return s
+}
+
+func newHarnessWithScheme(t *testing.T, s *runtime.Scheme, inst *cyphrav1.Neo4jInstance, objs ...client.Object) *harness {
 	c := fake.NewClientBuilder().WithScheme(s).
 		WithObjects(append([]client.Object{inst}, objs...)...).
 		WithStatusSubresource(&cyphrav1.Neo4jInstance{}, &appsv1.StatefulSet{}, &batchv1.Job{}).
