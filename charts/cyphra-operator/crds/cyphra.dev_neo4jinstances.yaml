@@ -287,7 +287,7 @@ spec:
                 type: object
                 x-kubernetes-validations:
                 - message: tls needs secretName, issuerRef or both
-                  rule: (has(self.secretName) && self.secretName != ”) || has(self.issuerRef)
+                  rule: (has(self.secretName) && size(self.secretName) > 0) || has(self.issuerRef)
               version:
                 default: "5.26"
                 description: Neo4j version, used as the image tag `neo4j:<version>-community`.

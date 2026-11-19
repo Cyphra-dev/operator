@@ -82,7 +82,7 @@ type ServiceSpec struct {
 }
 
 // TLSSpec references the certificate used for Bolt and HTTPS.
-// +kubebuilder:validation:XValidation:rule="(has(self.secretName) && self.secretName != ”) || has(self.issuerRef)",message="tls needs secretName, issuerRef or both"
+// +kubebuilder:validation:XValidation:rule="(has(self.secretName) && size(self.secretName) > 0) || has(self.issuerRef)",message="tls needs secretName, issuerRef or both"
 type TLSSpec struct {
 	// SecretName of a `kubernetes.io/tls` Secret with `tls.crt` and `tls.key`.
 	// With `issuerRef`, the issued certificate is written here; it then defaults to `<name>-tls`.
