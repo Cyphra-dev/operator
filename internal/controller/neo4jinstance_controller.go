@@ -11,9 +11,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
@@ -39,6 +41,10 @@ type Neo4jInstanceReconciler struct {
 	Recorder events.EventRecorder
 	// Now is overridable in tests.
 	Now func() time.Time
+	// StatsSummary reads kubelet volume stats for status.storage.usedBytes; nil disables it.
+	StatsSummary StatsSummaryFunc
+	// UsageInterval is how often volume usage is measured (default DefaultUsageInterval).
+	UsageInterval time.Duration
 }
 
 // +kubebuilder:rbac:groups=cyphra.dev,resources=neo4jinstances,verbs=get;list;watch;update;patch
@@ -49,6 +55,10 @@ type Neo4jInstanceReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=nodes/proxy,verbs=get
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;create;update;patch
 
 func (r *Neo4jInstanceReconciler) now() time.Time {
 	if r.Now != nil {
@@ -69,9 +79,13 @@ func (r *Neo4jInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	var inst cyphrav1.Neo4jInstance
 	if err := r.Get(ctx, req.NamespacedName, &inst); err != nil {
+		if apierrors.IsNotFound(err) {
+			deleteMetrics(req.Namespace, req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !inst.DeletionTimestamp.IsZero() {
+		deleteMetrics(inst.Namespace, inst.Name)
 		return ctrl.Result{}, nil // owned objects are garbage-collected
 	}
 
@@ -80,6 +94,10 @@ func (r *Neo4jInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	if err := r.ensureServices(ctx, &inst); err != nil {
 		return ctrl.Result{}, err
+	}
+	certReady, err := r.ensureCertificate(ctx, &inst)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("certificate: %w", err)
 	}
 
 	// Decide whether a backup should be running before shaping the StatefulSet, using the live
@@ -117,14 +135,32 @@ func (r *Neo4jInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("statefulset: %w", err)
 	}
 
-	if err := r.updateStatus(ctx, &inst, sts); err != nil {
+	usageRequeue, err := r.reconcileStorage(ctx, &inst)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("storage: %w", err)
+	}
+	requeue = minRequeue(requeue, usageRequeue)
+	if !certReady {
+		requeue = minRequeue(requeue, 15*time.Second)
+	}
+
+	if err := r.updateStatus(ctx, &inst, sts, certReady); err != nil {
 		if apierrors.IsConflict(err) {
 			return ctrl.Result{Requeue: true}, nil
 		}
 		return ctrl.Result{}, err
 	}
+	recordMetrics(&inst)
 	log.V(1).Info("reconciled", "phase", inst.Status.Phase)
 	return ctrl.Result{RequeueAfter: requeue}, nil
+}
+
+// minRequeue returns the shorter non-zero delay (0 means "no requeue").
+func minRequeue(a, b time.Duration) time.Duration {
+	if a == 0 || (b != 0 && b < a) {
+		return b
+	}
+	return a
 }
 
 func randomPassword() (string, error) {
@@ -142,7 +178,18 @@ func (r *Neo4jInstanceReconciler) ensurePasswordSecret(ctx context.Context, inst
 	}
 	var existing corev1.Secret
 	err := r.Get(ctx, types.NamespacedName{Namespace: inst.Namespace, Name: authSecretName(inst)}, &existing)
-	if err == nil || !apierrors.IsNotFound(err) {
+	if err == nil {
+		// Keep `uri` current (e.g. when a public hostname is added); the password is never rotated.
+		if string(existing.Data["uri"]) == Endpoint(inst) {
+			return nil
+		}
+		if existing.Data == nil {
+			existing.Data = map[string][]byte{}
+		}
+		existing.Data["uri"] = []byte(Endpoint(inst))
+		return r.Update(ctx, &existing)
+	}
+	if !apierrors.IsNotFound(err) {
 		return err
 	}
 	pw, err := randomPassword()
@@ -180,11 +227,8 @@ func (r *Neo4jInstanceReconciler) ensureServices(ctx context.Context, inst *cyph
 	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: inst.Name, Namespace: inst.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
 		svc.Labels = Labels(inst)
-		svc.Annotations = inst.Spec.Service.Annotations
-		t := inst.Spec.Service.Type
-		if t == "" {
-			t = corev1.ServiceTypeClusterIP
-		}
+		svc.Annotations = ServiceAnnotations(inst)
+		t := ServiceType(inst)
 		svc.Spec.Type = t
 		svc.Spec.Selector = SelectorLabels(inst)
 		// Keep allocated node ports stable across updates.
@@ -203,6 +247,64 @@ func (r *Neo4jInstanceReconciler) ensureServices(ctx context.Context, inst *cyph
 		return fmt.Errorf("service: %w", err)
 	}
 	return nil
+}
+
+func (r *Neo4jInstanceReconciler) setCertCondition(inst *cyphrav1.Neo4jInstance, ready bool, reason, msg string) {
+	status := metav1.ConditionFalse
+	if ready {
+		status = metav1.ConditionTrue
+	}
+	meta.SetStatusCondition(&inst.Status.Conditions, metav1.Condition{
+		Type: cyphrav1.ConditionCertificateReady, Status: status,
+		Reason: reason, Message: msg, ObservedGeneration: inst.Generation,
+	})
+}
+
+// ensureCertificate requests the TLS certificate from cert-manager when spec.tls.issuerRef is set,
+// and reports whether it has been issued. Without an issuerRef the TLS Secret is the user's.
+func (r *Neo4jInstanceReconciler) ensureCertificate(ctx context.Context, inst *cyphrav1.Neo4jInstance) (bool, error) {
+	if inst.Spec.TLS == nil || inst.Spec.TLS.IssuerRef == nil {
+		meta.RemoveStatusCondition(&inst.Status.Conditions, cyphrav1.ConditionCertificateReady)
+		return true, nil
+	}
+	desired := Certificate(inst)
+	cert := &unstructured.Unstructured{}
+	cert.SetGroupVersionKind(CertificateGVK)
+	err := r.Get(ctx, client.ObjectKeyFromObject(desired), cert)
+	switch {
+	case meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err):
+		r.setCertCondition(inst, false, "CertManagerNotInstalled",
+			"tls.issuerRef needs cert-manager (the cert-manager.io/v1 Certificate kind is not available)")
+		return false, nil
+	case apierrors.IsNotFound(err):
+		if err := controllerutil.SetControllerReference(inst, desired, r.Scheme); err != nil {
+			return false, err
+		}
+		if err := r.Create(ctx, desired); err != nil {
+			return false, err
+		}
+		r.event(inst, corev1.EventTypeNormal, "CertificateRequested", "requested a certificate for "+TLSSecretName(inst))
+		r.setCertCondition(inst, false, "Issuing", "waiting for cert-manager to issue the certificate")
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+
+	if !equality.Semantic.DeepEqual(cert.Object["spec"], desired.Object["spec"]) ||
+		!equality.Semantic.DeepEqual(cert.GetLabels(), desired.GetLabels()) {
+		cert.Object["spec"] = desired.Object["spec"]
+		cert.SetLabels(desired.GetLabels())
+		if err := r.Update(ctx, cert); err != nil {
+			return false, err
+		}
+	}
+	ready, msg := CertificateReady(cert)
+	if ready {
+		r.setCertCondition(inst, true, "Issued", "certificate issued into Secret "+TLSSecretName(inst))
+	} else {
+		r.setCertCondition(inst, false, "Issuing", msg)
+	}
+	return ready, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +467,7 @@ func (r *Neo4jInstanceReconciler) podStopped(ctx context.Context, inst *cyphrav1
 // Status
 // ---------------------------------------------------------------------------
 
-func (r *Neo4jInstanceReconciler) updateStatus(ctx context.Context, inst *cyphrav1.Neo4jInstance, sts *appsv1.StatefulSet) error {
+func (r *Neo4jInstanceReconciler) updateStatus(ctx context.Context, inst *cyphrav1.Neo4jInstance, sts *appsv1.StatefulSet, certReady bool) error {
 	ref := PasswordRef(inst)
 	inst.Status.Endpoint = Endpoint(inst)
 	inst.Status.PasswordSecret = ref.Name + "/" + ref.Key
@@ -377,7 +479,7 @@ func (r *Neo4jInstanceReconciler) updateStatus(ctx context.Context, inst *cyphra
 		inst.Status.Phase = cyphrav1.PhaseBackingUp
 	case inst.Spec.Stopped:
 		inst.Status.Phase = cyphrav1.PhaseStopped
-	case ready:
+	case ready && certReady:
 		inst.Status.Phase = cyphrav1.PhaseReady
 	default:
 		inst.Status.Phase = cyphrav1.PhaseProvisioning
@@ -389,6 +491,9 @@ func (r *Neo4jInstanceReconciler) updateStatus(ctx context.Context, inst *cyphra
 	}
 	if inst.Status.Phase == cyphrav1.PhaseReady {
 		cond.Status, cond.Message = metav1.ConditionTrue, "Neo4j accepts Bolt connections"
+	}
+	if inst.Status.Phase == cyphrav1.PhaseProvisioning && !certReady {
+		cond.Message = "waiting for the TLS certificate"
 	}
 	if inst.Status.Phase == cyphrav1.PhaseBackingUp {
 		cond.Message = "stopped for a backup"

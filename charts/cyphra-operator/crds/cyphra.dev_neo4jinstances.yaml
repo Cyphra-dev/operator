@@ -29,6 +29,17 @@ spec:
     - jsonPath: .status.endpoint
       name: Endpoint
       type: string
+    - jsonPath: .spec.storage.size
+      name: Size
+      type: string
+    - jsonPath: .status.storage.usedBytes
+      name: Used bytes
+      priority: 1
+      type: integer
+    - jsonPath: .spec.hostname
+      name: Hostname
+      priority: 1
+      type: string
     - jsonPath: .status.backup.lastSuccessfulTime
       name: Last backup
       type: date
@@ -109,6 +120,15 @@ spec:
                 description: 'Config adds Neo4j settings, e.g. `db.transaction.timeout:
                   30s`. Keys are Neo4j setting names.'
                 type: object
+              hostname:
+                description: |-
+                  Hostname is the public DNS name clients use, e.g. `abc123.eu.db.example.com`. When set,
+                  `status.endpoint` becomes `neo4j+s://<hostname>:7687`, Neo4j advertises this name to routing
+                  drivers, the client Service gets an `external-dns.alpha.kubernetes.io/hostname` annotation and
+                  its type defaults to LoadBalancer. Requires `tls`.
+                maxLength: 253
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                type: string
               image:
                 description: Image overrides the container image (the version is then
                   ignored for the image).
@@ -208,9 +228,8 @@ spec:
                       settings).
                     type: object
                   type:
-                    default: ClusterIP
-                    description: Service Type string describes ingress methods for
-                      a service
+                    description: Type of the Service. Defaults to LoadBalancer when
+                      `hostname` is set, ClusterIP otherwise.
                     enum:
                     - ClusterIP
                     - LoadBalancer
@@ -240,19 +259,44 @@ spec:
                 description: TLS enables encrypted Bolt and HTTPS using a `kubernetes.io/tls`
                   Secret (e.g. from cert-manager).
                 properties:
+                  issuerRef:
+                    description: |-
+                      IssuerRef makes the operator request the certificate from cert-manager: a
+                      `cert-manager.io/v1` Certificate for `hostname` (or the in-cluster Service names when no
+                      hostname is set). The instance becomes Ready once the certificate is issued.
+                    properties:
+                      group:
+                        description: Group of an external issuer; defaults to `cert-manager.io`.
+                        type: string
+                      kind:
+                        default: Issuer
+                        description: Kind is `Issuer` (same namespace) or `ClusterIssuer`,
+                          or an external issuer's kind.
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
                   secretName:
-                    description: SecretName of a `kubernetes.io/tls` Secret with `tls.crt`
-                      and `tls.key`.
+                    description: |-
+                      SecretName of a `kubernetes.io/tls` Secret with `tls.crt` and `tls.key`.
+                      With `issuerRef`, the issued certificate is written here; it then defaults to `<name>-tls`.
                     type: string
-                required:
-                - secretName
                 type: object
+                x-kubernetes-validations:
+                - message: tls needs secretName, issuerRef or both
+                  rule: (has(self.secretName) && size(self.secretName) > 0) || has(self.issuerRef)
               version:
                 default: "5.26"
                 description: Neo4j version, used as the image tag `neo4j:<version>-community`.
                 pattern: ^[0-9]+(\.[0-9]+){0,2}$
                 type: string
             type: object
+            x-kubernetes-validations:
+            - message: hostname requires tls (secretName or issuerRef)
+              rule: '!has(self.hostname) || has(self.tls)'
           status:
             description: Neo4jInstanceStatus is the observed state.
             properties:
@@ -332,7 +376,9 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               endpoint:
-                description: Bolt URI clients use inside the cluster, e.g. neo4j://blog.default.svc:7687.
+                description: |-
+                  Bolt URI clients use: in-cluster (neo4j://blog.default.svc:7687), or the public
+                  neo4j+s://<hostname>:7687 when `spec.hostname` is set.
                 type: string
               observedGeneration:
                 format: int64
@@ -350,6 +396,24 @@ spec:
                 - Stopped
                 - Failed
                 type: string
+              storage:
+                description: StorageStatus reports the data volume's size and usage.
+                properties:
+                  capacityBytes:
+                    description: Provisioned size of the data volume (the PersistentVolumeClaim's
+                      capacity).
+                    format: int64
+                    type: integer
+                  lastUpdateTime:
+                    description: When usedBytes was last measured.
+                    format: date-time
+                    type: string
+                  usedBytes:
+                    description: Bytes used on the data volume, as reported by the
+                      kubelet. Kept while the instance is stopped.
+                    format: int64
+                    type: integer
+                type: object
             type: object
         type: object
     served: true

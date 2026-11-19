@@ -30,6 +30,7 @@ spec:
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=:8080
             - --zap-log-level={{ .Values.logLevel }}
+            - --usage-refresh-interval={{ .Values.usageRefreshInterval }}
             {{- if .Values.leaderElection }}
             - --leader-elect
             {{- end }}
