@@ -27,3 +27,6 @@ spec:
     limits: { memory: 1Gi }
   tls:
     secretName: secure-tls
+  # Public endpoint: neo4j+s://<hostname>, an external-dns annotation, and a LoadBalancer Service
+  # by default (it stays pending in kind, which does not block readiness).
+  hostname: secure.e2e.example.test

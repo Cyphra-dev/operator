@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end test in a throwaway kind cluster:
-#   operator (Helm) → Neo4jInstance (plain + TLS) → data written through a client → on-demand
-#   backup to an S3 server (rclone serve s3) → data still there after the instance restarts.
+#   operator (Helm) → Neo4jInstance (plain + TLS with a public hostname) → data written through a
+#   client → status.storage populated → on-demand backup to an S3 server (rclone serve s3) → data
+#   still there after the instance restarts → storage.size changes reported.
 #
 # Env: CLUSTER (default cyphra-e2e), KEEP=1 keeps the cluster, NEO4J_VERSION (default 5.26),
 #      CLIENT_CMD: optional command run with NEO4J_URI/USER/PASSWORD exported to write test data
@@ -46,7 +47,8 @@ kind load docker-image --name "$CLUSTER" "$IMG" >/dev/null
 
 log "operator"
 helm upgrade --install cyphra-operator charts/cyphra-operator -n cyphra-system --create-namespace \
-  --set image.tag="$TAG" --set image.pullPolicy=Never --set logLevel=debug --wait --timeout 3m
+  --set image.tag="$TAG" --set image.pullPolicy=Never --set logLevel=debug \
+  --set usageRefreshInterval=15s --wait --timeout 3m
 
 log "S3 server (rclone serve s3) and credentials"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
@@ -75,10 +77,27 @@ cypher() { kubectl -n "$NS" exec "$1-0" -c neo4j -- cypher-shell -a "$2" -u neo4
 
 log "TLS: Bolt requires encryption"
 SECURE_PW=$(kubectl -n "$NS" get secret secure-auth -o jsonpath='{.data.password}' | base64 -d)
-cypher secure "neo4j+ssc://localhost:7687" "$SECURE_PW" "RETURN 1 AS ok" | grep -q 1 || fail "TLS connection failed"
-if cypher secure "neo4j://localhost:7687" "$SECURE_PW" "RETURN 1" >/dev/null 2>&1; then
+# Direct (bolt+) connections: a routing driver would follow the advertised public hostname,
+# which does not resolve in kind.
+cypher secure "bolt+ssc://localhost:7687" "$SECURE_PW" "RETURN 1 AS ok" | grep -q 1 || fail "TLS connection failed"
+if cypher secure "bolt://localhost:7687" "$SECURE_PW" "RETURN 1" >/dev/null 2>&1; then
   fail "plaintext Bolt was accepted on a TLS instance"
 fi
+
+log "public hostname"
+HOST=secure.e2e.example.test
+EP=$(kubectl -n "$NS" get neo4jinstance secure -o jsonpath='{.status.endpoint}')
+[ "$EP" = "neo4j+s://$HOST:7687" ] || fail "status.endpoint = $EP"
+ANN=$(kubectl -n "$NS" get svc secure -o jsonpath='{.metadata.annotations.external-dns\.alpha\.kubernetes\.io/hostname}')
+[ "$ANN" = "$HOST" ] || fail "external-dns annotation = '$ANN'"
+SVC_TYPE=$(kubectl -n "$NS" get svc secure -o jsonpath='{.spec.type}')
+[ "$SVC_TYPE" = LoadBalancer ] || fail "service type = $SVC_TYPE, want LoadBalancer by default"
+URI=$(kubectl -n "$NS" get secret secure-auth -o jsonpath='{.data.uri}' | base64 -d)
+[ "$URI" = "neo4j+s://$HOST:7687" ] || fail "auth secret uri = $URI"
+ADV=$(cypher secure "bolt+ssc://localhost:7687" "$SECURE_PW" \
+  "SHOW SETTINGS YIELD name, value WHERE name = 'server.default_advertised_address' RETURN value" | tail -1)
+[ "$ADV" = "\"$HOST\"" ] || [ "$ADV" = "$HOST" ] || fail "advertised address = $ADV"
+echo "endpoint $EP, advertised $ADV"
 
 log "write data"
 if [ -n "${CLIENT_CMD:-}" ]; then
@@ -95,6 +114,28 @@ fi
 BEFORE=$(cypher blog "neo4j://localhost:7687" "$PASSWORD" "MATCH (n) RETURN count(n) AS c" | tail -1)
 [ "$BEFORE" -gt 0 ] || fail "no data written"
 echo "nodes before backup: $BEFORE"
+
+log "storage usage in status"
+NODE=$(kubectl -n "$NS" get pod blog-0 -o jsonpath='{.spec.nodeName}')
+USED= CAP=
+for _ in $(seq 1 36); do
+  CAP=$(kubectl -n "$NS" get neo4jinstance blog -o jsonpath='{.status.storage.capacityBytes}')
+  USED=$(kubectl -n "$NS" get neo4jinstance blog -o jsonpath='{.status.storage.usedBytes}')
+  [ -n "$CAP" ] && [ -n "$USED" ] && break
+  sleep 5
+done
+[ "${CAP:-0}" -gt 0 ] || fail "status.storage.capacityBytes not set"
+if [ -z "$USED" ]; then
+  # Some provisioners (hostPath volumes) are not measured by the kubelet: only fail if it does.
+  if kubectl get --raw "/api/v1/nodes/$NODE/proxy/stats/summary" | grep -q '"name": *"data-blog-0"'; then
+    fail "the kubelet reports the data volume, but status.storage.usedBytes is not set"
+  fi
+  echo "kubelet does not measure this volume type; capacity $CAP bytes"
+else
+  [ "$USED" -gt 0 ] || fail "status.storage.usedBytes = $USED"
+  echo "used $USED of $CAP bytes"
+fi
+kubectl -n "$NS" get neo4jinstances -o wide
 
 log "on-demand backup"
 kubectl -n "$NS" annotate neo4jinstance blog cyphra.dev/backup-requested-at="$(date -u +%FT%TZ)" --overwrite
@@ -119,5 +160,32 @@ kubectl -n "$NS" wait --for=jsonpath='{.status.phase}'=Ready neo4jinstance/blog 
   || fail "blog did not come back after the backup"
 AFTER=$(cypher blog "neo4j://localhost:7687" "$PASSWORD" "MATCH (n) RETURN count(n) AS c" | tail -1)
 [ "$AFTER" = "$BEFORE" ] || fail "node count changed across the backup: $BEFORE -> $AFTER"
+
+storage_condition() {
+  kubectl -n "$NS" get neo4jinstance blog \
+    -o jsonpath='{.status.conditions[?(@.type=="StorageResizeFailed")].status}/{.status.conditions[?(@.type=="StorageResizeFailed")].reason}'
+}
+wait_storage_condition() {
+  for _ in $(seq 1 24); do
+    [ "$(storage_condition)" = "$1" ] && return 0
+    sleep 5
+  done
+  fail "StorageResizeFailed = $(storage_condition), want $1"
+}
+
+log "volume expansion"
+SC=$(kubectl -n "$NS" get pvc data-blog-0 -o jsonpath='{.spec.storageClassName}')
+EXPANDABLE=$(kubectl get storageclass "$SC" -o jsonpath='{.allowVolumeExpansion}')
+kubectl -n "$NS" patch neo4jinstance blog --type=merge -p '{"spec":{"storage":{"size":"2Gi"}}}'
+if [ "$EXPANDABLE" = true ]; then
+  wait_storage_condition False/Expanding
+  REQ=$(kubectl -n "$NS" get pvc data-blog-0 -o jsonpath='{.spec.resources.requests.storage}')
+  [ "$REQ" = 2Gi ] || fail "PVC request = $REQ, want 2Gi"
+else
+  wait_storage_condition True/ExpansionNotSupported
+fi
+echo "StorageClass $SC (allowVolumeExpansion=${EXPANDABLE:-false}): $(storage_condition)"
+kubectl -n "$NS" patch neo4jinstance blog --type=merge -p '{"spec":{"storage":{"size":"512Mi"}}}'
+wait_storage_condition True/ShrinkNotSupported
 
 log "PASS"
