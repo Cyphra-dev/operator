@@ -1,0 +1,21 @@
+# A Neo4j instance reachable from the internet at neo4j+s://abc123.eu.db.example.com:7687.
+#
+# Needs cert-manager with a ClusterIssuer using a DNS-01 solver, and external-dns watching Services.
+#   kubectl apply -f examples/public.yaml
+#   kubectl get neo4jinstance abc123 -o jsonpath='{.status.endpoint}'
+apiVersion: cyphra.dev/v1alpha1
+kind: Neo4jInstance
+metadata:
+  name: abc123
+spec:
+  version: "5.26"
+  hostname: abc123.eu.db.example.com
+  tls:
+    issuerRef: { name: letsencrypt-dns, kind: ClusterIssuer } # issued into the Secret abc123-tls
+  resources:
+    requests: { cpu: 250m, memory: 1Gi }
+    limits: { memory: 1Gi }
+  storage:
+    size: 5Gi # can be increased later if the StorageClass allows volume expansion
+  # service.type defaults to LoadBalancer with a hostname. Behind a shared SNI proxy, use:
+  # service: { type: ClusterIP }
